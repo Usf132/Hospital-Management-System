@@ -1,8 +1,16 @@
 #include <iostream>
 #include <string>
-#include <vector>
+#include <map>
 #include <stack>
 #include <queue>
+#include <memory>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+
 using namespace std;
 
 // ========== ENUMERATIONS ========== //
@@ -24,6 +32,106 @@ enum RoomType
     SEMI_PRIVATE
 };
 
+// Helper to convert enum to string for file storage
+string departmentToString(Department d)
+{
+    switch (d)
+    {
+    case CARDIOLOGY:
+        return "0";
+    case NEUROLOGY:
+        return "1";
+    case ORTHOPEDICS:
+        return "2";
+    case PEDIATRICS:
+        return "3";
+    case EMERGENCY:
+        return "4";
+    case GENERAL:
+        return "5";
+    default:
+        return "5";
+    }
+}
+
+string roomTypeToString(RoomType r)
+{
+    switch (r)
+    {
+    case GENERAL_WARD:
+        return "0";
+    case ICU:
+        return "1";
+    case PRIVATE_ROOM:
+        return "2";
+    case SEMI_PRIVATE:
+        return "3";
+    default:
+        return "0";
+    }
+}
+
+// Helper function to escape special characters in strings for serialization
+string escapeString(const string &str)
+{
+    string result;
+    for (char c : str)
+    {
+        if (c == '|')
+        {
+            result += "\\x01"; // Escape pipe character
+        }
+        else if (c == '\\')
+        {
+            result += "\\\\"; // Escape backslash
+        }
+        else if (c == ',')
+        {
+            result += "\\x02"; // Escape comma
+        }
+        else
+        {
+            result += c;
+        }
+    }
+    return result;
+}
+
+string unescapeString(const string &str)
+{
+    string result;
+    for (size_t i = 0; i < str.length(); i++)
+    {
+        if (str[i] == '\\' && i + 3 < str.length())
+        {
+            if (str.substr(i, 4) == "\\x01")
+            {
+                result += '|';
+                i += 3;
+            }
+            else if (str.substr(i, 4) == "\\x02")
+            {
+                result += ',';
+                i += 3;
+            }
+            else
+            {
+                result += str[i];
+            }
+        }
+        else if (str[i] == '\\' && i + 1 < str.length() && str[i + 1] == '\\')
+        {
+            result += '\\';
+            i += 1;
+        }
+        else
+        {
+            result += str[i];
+        }
+    }
+    return result;
+}
+
 // ========== PATIENT CLASS ========== //
 class Patient
 {
@@ -38,7 +146,12 @@ private:
     RoomType roomType;
 
 public:
-    Patient(int pid, string n, int a, string c) : id(pid), name(n), age(a), contact(c), isAdmitted(false) {}
+    // Main constructor - initializes roomType to GENERAL_WARD
+    Patient(int pid, string n, int a, string c)
+        : id(pid), name(n), age(a), contact(c), isAdmitted(false), roomType(GENERAL_WARD) {}
+
+    // Default constructor for deserialization - also initializes roomType
+    Patient() : id(0), name(""), age(0), contact(""), isAdmitted(false), roomType(GENERAL_WARD) {}
 
     // Getter methods
     int getId() const { return id; }
@@ -46,6 +159,7 @@ public:
     int getAge() const { return age; }
     string getContact() const { return contact; }
     bool getAdmissionStatus() const { return isAdmitted; }
+    RoomType getRoomType() const { return roomType; }
 
     string getRoomTypeName() const
     {
@@ -95,7 +209,13 @@ public:
 
     void addMedicalRecord(string record)
     {
-        medicalHistory.push(record);
+        auto now = chrono::system_clock::now();
+        time_t time = chrono::system_clock::to_time_t(now);
+        string timestamp = ctime(&time);
+        timestamp.pop_back(); // Remove newline
+
+        string recordWithTimestamp = "[" + timestamp + "] " + record;
+        medicalHistory.push(recordWithTimestamp);
         cout << "Medical record added for [" << name << "]: " << record << endl;
     }
 
@@ -132,11 +252,119 @@ public:
         }
 
         stack<string> temp = medicalHistory;
+        vector<string> records;
 
         while (!temp.empty())
         {
-            cout << " - " << temp.top() << endl;
+            records.push_back(temp.top());
             temp.pop();
+        }
+
+        // Display in chronological order (oldest first)
+        for (auto it = records.rbegin(); it != records.rend(); ++it)
+        {
+            cout << " - " << *it << endl;
+        }
+    }
+
+    // Serialization for file I/O - now includes medicalHistory and testQueue
+    string serialize() const
+    {
+        stringstream ss;
+
+        // Basic info
+        ss << id << "," << escapeString(name) << "," << age << ","
+           << escapeString(contact) << "," << (isAdmitted ? "1" : "0")
+           << "," << roomTypeToString(roomType);
+
+        // Serialize medicalHistory stack (preserving order - oldest first for storage)
+        ss << ",MEDICAL_HISTORY:";
+        stack<string> tempHistory = medicalHistory;
+        vector<string> historyVec;
+        while (!tempHistory.empty())
+        {
+            historyVec.push_back(escapeString(tempHistory.top()));
+            tempHistory.pop();
+        }
+        // Store from oldest to newest (reverse of stack order)
+        for (int i = historyVec.size() - 1; i >= 0; i--)
+        {
+            if (i != historyVec.size() - 1)
+                ss << "|";
+            ss << historyVec[i];
+        }
+
+        // Serialize testQueue (FIFO order)
+        ss << ",TEST_QUEUE:";
+        queue<string> tempQueue = testQueue;
+        bool first = true;
+        while (!tempQueue.empty())
+        {
+            if (!first)
+                ss << "|";
+            ss << escapeString(tempQueue.front());
+            tempQueue.pop();
+            first = false;
+        }
+
+        return ss.str();
+    }
+
+    void deserialize(const string &data)
+    {
+        stringstream ss(data);
+        string token;
+
+        // Parse basic info
+        getline(ss, token, ',');
+        id = stoi(token);
+        getline(ss, name, ',');
+        name = unescapeString(name);
+        getline(ss, token, ',');
+        age = stoi(token);
+        getline(ss, contact, ',');
+        contact = unescapeString(contact);
+        getline(ss, token, ',');
+        isAdmitted = (token == "1");
+        getline(ss, token, ',');
+        roomType = static_cast<RoomType>(stoi(token));
+
+        // Parse medical history
+        getline(ss, token, ',');
+        if (token.find("MEDICAL_HISTORY:") == 0)
+        {
+            string historyData = token.substr(16); // Remove "MEDICAL_HISTORY:"
+            stringstream historyStream(historyData);
+            string record;
+            vector<string> historyVec;
+            while (getline(historyStream, record, '|'))
+            {
+                if (!record.empty())
+                {
+                    historyVec.push_back(unescapeString(record));
+                }
+            }
+            // Push records in original order (oldest first) to maintain chronology
+            for (const string &rec : historyVec)
+            {
+                medicalHistory.push(rec);
+            }
+        }
+
+        // Parse test queue
+        getline(ss, token, ',');
+        if (token.find("TEST_QUEUE:") == 0)
+        {
+            string testData = token.substr(11); // Remove "TEST_QUEUE:"
+            stringstream testStream(testData);
+            string test;
+            while (getline(testStream, test, '|'))
+            {
+                if (!test.empty())
+                {
+                    testQueue.push(unescapeString(test));
+                }
+            }
         }
     }
 };
@@ -151,17 +379,17 @@ private:
     queue<int> appointmentQueue;
 
 public:
-    // Constructor
     Doctor(int did, string n, Department d) : id(did), name(n), department(d) {}
 
-    // Adds a patient ID to the appointment queue (FIFO)
+    // Default constructor for deserialization
+    Doctor() : id(0), name(""), department(GENERAL) {}
+
     void addAppointment(int patientId)
     {
         appointmentQueue.push(patientId);
         cout << "Appointment added for patient " << patientId << " with " << name << endl;
     }
 
-    // Processes the next patient in the queue
     int seePatient()
     {
         if (appointmentQueue.empty())
@@ -178,11 +406,10 @@ public:
         }
     }
 
-    // Getters
     int getId() const { return id; }
     string getName() const { return name; }
+    Department getDepartmentEnum() const { return department; }
 
-    // Converts the enum to a human-readable string
     string getDepartment() const
     {
         switch (department)
@@ -208,120 +435,243 @@ public:
     {
         return appointmentQueue.size();
     }
+
+    // Serialization - now escapes name (Bug #2 fixed)
+    string serialize() const
+    {
+        stringstream ss;
+        ss << id << "," << escapeString(name) << "," << departmentToString(department);
+        return ss.str();
+    }
+
+    void deserialize(const string &data)
+    {
+        stringstream ss(data);
+        string token;
+        getline(ss, token, ',');
+        id = stoi(token);
+        getline(ss, name, ',');
+        name = unescapeString(name);
+        getline(ss, token, ',');
+        department = static_cast<Department>(stoi(token));
+    }
 };
 
 // ========== HOSPITAL CLASS ========== //
 class Hospital
 {
 private:
-    vector<Patient> patients;
-    vector<Doctor> doctors;
+    map<int, unique_ptr<Patient>> patients;
+    map<int, unique_ptr<Doctor>> doctors;
     queue<int> emergencyQueue;
     int patientCounter;
     int doctorCounter;
+    const string DATA_FILE = "hospital_data.txt";
+
+    void saveToFile()
+    {
+        ofstream outFile(DATA_FILE);
+        if (!outFile.is_open())
+        {
+            cerr << "Warning: Could not open file for writing." << endl;
+            return;
+        }
+
+        // Save patient counter
+        outFile << "PATIENT_COUNTER:" << patientCounter << endl;
+
+        // Save all patients
+        outFile << "PATIENTS:" << endl;
+        for (const auto &[id, patient] : patients)
+        {
+            outFile << patient->serialize() << endl;
+        }
+        outFile << "END_PATIENTS" << endl;
+
+        // Save doctor counter
+        outFile << "DOCTOR_COUNTER:" << doctorCounter << endl;
+
+        // Save all doctors
+        outFile << "DOCTORS:" << endl;
+        for (const auto &[id, doctor] : doctors)
+        {
+            outFile << doctor->serialize() << endl;
+        }
+        outFile << "END_DOCTORS" << endl;
+
+        // Save emergency queue
+        outFile << "EMERGENCY_QUEUE:" << endl;
+        queue<int> tempQueue = emergencyQueue;
+        vector<int> emergencyItems;
+        while (!tempQueue.empty())
+        {
+            emergencyItems.push_back(tempQueue.front());
+            tempQueue.pop();
+        }
+        for (int item : emergencyItems)
+        {
+            outFile << item << endl;
+        }
+        outFile << "END_EMERGENCY" << endl;
+
+        outFile.close();
+        cout << "Data saved successfully to " << DATA_FILE << endl;
+    }
+
+    void loadFromFile()
+    {
+        ifstream inFile(DATA_FILE);
+        if (!inFile.is_open())
+        {
+            cout << "No existing data file found. Starting fresh." << endl;
+            return;
+        }
+
+        string line;
+        string section = "";
+
+        while (getline(inFile, line))
+        {
+            if (line.empty())
+                continue;
+
+            if (line.find("PATIENT_COUNTER:") == 0)
+            {
+                patientCounter = stoi(line.substr(16)); // "PATIENT_COUNTER:" is 16 chars
+                continue;
+            }
+            else if (line.find("DOCTOR_COUNTER:") == 0)
+            {
+                doctorCounter = stoi(line.substr(15)); // "DOCTOR_COUNTER:" is 15 chars
+                continue;
+            }
+            else if (line == "PATIENTS:")
+            {
+                section = "PATIENTS";
+                continue;
+            }
+            else if (line == "DOCTORS:")
+            {
+                section = "DOCTORS";
+                continue;
+            }
+            else if (line == "EMERGENCY_QUEUE:")
+            {
+                section = "EMERGENCY";
+                continue;
+            }
+            else if (line == "END_PATIENTS" || line == "END_DOCTORS" || line == "END_EMERGENCY")
+            {
+                section = "";
+                continue;
+            }
+
+            if (section == "PATIENTS")
+            {
+                auto patient = make_unique<Patient>();
+                patient->deserialize(line);
+                patients[patient->getId()] = move(patient);
+            }
+            else if (section == "DOCTORS")
+            {
+                auto doctor = make_unique<Doctor>();
+                doctor->deserialize(line);
+                doctors[doctor->getId()] = move(doctor);
+            }
+            else if (section == "EMERGENCY")
+            {
+                emergencyQueue.push(stoi(line));
+            }
+        }
+
+        inFile.close();
+        if (patients.size() > 0 || doctors.size() > 0)
+        {
+            cout << "Data loaded successfully from " << DATA_FILE << endl;
+            cout << "Loaded " << patients.size() << " patients and " << doctors.size() << " doctors." << endl;
+        }
+    }
+
+    bool isPatientIdExists(int id) const
+    {
+        return patients.find(id) != patients.end();
+    }
+
+    bool isDoctorIdExists(int id) const
+    {
+        return doctors.find(id) != doctors.end();
+    }
 
 public:
-    // ---- Constructor ----
-    Hospital() : patientCounter(1), doctorCounter(1) {}
+    Hospital() : patientCounter(1), doctorCounter(1)
+    {
+        loadFromFile();
+    }
 
-    // ---- registerPatient ----
+    ~Hospital()
+    {
+        saveToFile();
+    }
+
     int registerPatient(string name, int age, string contact)
     {
-        // Validate input
         if (name.empty() || age <= 0 || age > 120 || contact.empty())
         {
-            cout << "Error: Invalid patient information." << endl;
-            return -1;
+            throw invalid_argument("Error: Invalid patient information.");
         }
 
-        Patient p(patientCounter, name, age, contact);
-        patients.push_back(p);
+        int newId = patientCounter;
+        auto patient = make_unique<Patient>(newId, name, age, contact);
+        patients[newId] = move(patient);
+        patientCounter++;
+
         cout << "Patient registered: " << name
-             << " (ID: " << patientCounter << ")" << endl;
-        return patientCounter++;
+             << " (ID: " << newId << ")" << endl;
+        return newId;
     }
 
-    // ---- addDoctor ----
     int addDoctor(string name, Department dept)
     {
-        // Validate input
         if (name.empty())
         {
-            cout << "Error: Invalid doctor name." << endl;
-            return -1;
+            throw invalid_argument("Error: Invalid doctor name.");
         }
 
-        Doctor d(doctorCounter, name, dept);
-        doctors.push_back(d);
-
-        // Build department name for the print
-        string deptName;
-        switch (dept)
-        {
-        case CARDIOLOGY:
-            deptName = "Cardiology";
-            break;
-        case NEUROLOGY:
-            deptName = "Neurology";
-            break;
-        case ORTHOPEDICS:
-            deptName = "Orthopedics";
-            break;
-        case PEDIATRICS:
-            deptName = "Pediatrics";
-            break;
-        case EMERGENCY:
-            deptName = "Emergency";
-            break;
-        case GENERAL:
-            deptName = "General";
-            break;
-        }
+        int newId = doctorCounter;
+        auto doctor = make_unique<Doctor>(newId, name, dept);
+        doctors[newId] = move(doctor);
+        doctorCounter++;
 
         cout << "Doctor added: " << name
-             << " (ID: " << doctorCounter << ") - " << deptName << endl;
-        return doctorCounter++;
+             << " (ID: " << newId << ") - "
+             << doctors[newId]->getDepartment() << endl;
+        return newId;
     }
 
-    // ---- admitPatient ----
     void admitPatient(int patientId, RoomType type)
     {
-        for (int i = 0; i < (int)patients.size(); i++)
+        auto it = patients.find(patientId);
+        if (it != patients.end())
         {
-            if (patients[i].getId() == patientId)
-            {
-                patients[i].admitPatient(type);
-                return;
-            }
+            it->second->admitPatient(type);
         }
-        cout << "Patient not found." << endl;
+        else
+        {
+            throw runtime_error("Patient not found.");
+        }
     }
 
-    // ---- addEmergency ----
     void addEmergency(int patientId)
     {
-        // Check if patient exists
-        bool patientExists = false;
-        for (int i = 0; i < (int)patients.size(); i++)
+        if (!isPatientIdExists(patientId))
         {
-            if (patients[i].getId() == patientId)
-            {
-                patientExists = true;
-                break;
-            }
-        }
-
-        if (!patientExists)
-        {
-            cout << "Error: Patient ID " << patientId << " not found." << endl;
-            return;
+            throw runtime_error("Error: Patient ID " + to_string(patientId) + " not found.");
         }
 
         emergencyQueue.push(patientId);
         cout << "Emergency added for patient " << patientId << endl;
     }
 
-    // ---- handleEmergency ----
     int handleEmergency()
     {
         if (emergencyQueue.empty())
@@ -335,150 +685,162 @@ public:
         return patientId;
     }
 
-    // ---- bookAppointment ----
     void bookAppointment(int doctorId, int patientId)
     {
-        // Find doctor
-        int doctorIndex = -1;
-        for (int i = 0; i < (int)doctors.size(); i++)
+        if (!isDoctorIdExists(doctorId))
         {
-            if (doctors[i].getId() == doctorId)
-            {
-                doctorIndex = i;
-                break;
-            }
+            throw runtime_error("Error: Doctor ID " + to_string(doctorId) + " not found.");
         }
 
-        if (doctorIndex == -1)
+        if (!isPatientIdExists(patientId))
         {
-            cout << "Error: Doctor ID " << doctorId << " not found." << endl;
-            return;
+            throw runtime_error("Error: Patient ID " + to_string(patientId) + " not found.");
         }
 
-        // Find patient
-        bool patientFound = false;
-        for (int i = 0; i < (int)patients.size(); i++)
-        {
-            if (patients[i].getId() == patientId)
-            {
-                patientFound = true;
-                break;
-            }
-        }
-
-        if (!patientFound)
-        {
-            cout << "Error: Patient ID " << patientId << " not found." << endl;
-            return;
-        }
-
-        // Book appointment
-        doctors[doctorIndex].addAppointment(patientId);
+        doctors[doctorId]->addAppointment(patientId);
     }
 
-    // ---- displayPatientInfo ----
     void displayPatientInfo(int patientId)
     {
-        for (int i = 0; i < (int)patients.size(); i++)
+        auto it = patients.find(patientId);
+        if (it != patients.end())
         {
-            if (patients[i].getId() == patientId)
+            cout << "\n=== Patient Information ===" << endl
+                 << "ID: " << it->second->getId() << endl
+                 << "Name: " << it->second->getName() << endl
+                 << "Age: " << it->second->getAge() << endl
+                 << "Contact: " << it->second->getContact() << endl
+                 << "Admission Status: "
+                 << (it->second->getAdmissionStatus() ? "Admitted" : "Not Admitted") << endl;
+            if (it->second->getAdmissionStatus())
             {
-                cout << "=== Patient Information ===" << endl
-                     << "ID: " << patients[i].getId() << endl
-                     << "Name: " << patients[i].getName() << endl
-                     << "Age: " << patients[i].getAge() << endl
-                     << "Contact: " << patients[i].getContact() << endl
-                     << "Admission Status: "
-                     << (patients[i].getAdmissionStatus() ? "Admitted" : "Not Admitted") << endl;
-                if (patients[i].getAdmissionStatus())
-                {
-                    cout << "Room Type: " << patients[i].getRoomTypeName() << endl;
-                }
-                cout << "==========================" << endl;
-                return;
+                cout << "Room Type: " << it->second->getRoomTypeName() << endl;
             }
+            cout << "==========================\n"
+                 << endl;
         }
-        cout << "Patient not found." << endl;
+        else
+        {
+            throw runtime_error("Patient not found.");
+        }
     }
 
-    // ---- displayDoctorInfo ----
     void displayDoctorInfo(int doctorId)
     {
-        for (int i = 0; i < (int)doctors.size(); i++)
+        auto it = doctors.find(doctorId);
+        if (it != doctors.end())
         {
-            if (doctors[i].getId() == doctorId)
-            {
-                cout << "=== Doctor Information ===" << endl;
-                cout << "ID: " << doctors[i].getId() << endl;
-                cout << "Name: " << doctors[i].getName() << endl;
-                cout << "Department: " << doctors[i].getDepartment() << endl;
-                cout << "Pending Appointments: "
-                     << doctors[i].getAppointmentCount()
-                     << endl;
-                cout << "==========================" << endl;
-                return;
-            }
+            cout << "\n=== Doctor Information ===" << endl;
+            cout << "ID: " << it->second->getId() << endl;
+            cout << "Name: " << it->second->getName() << endl;
+            cout << "Department: " << it->second->getDepartment() << endl;
+            cout << "Pending Appointments: "
+                 << it->second->getAppointmentCount()
+                 << endl;
+            cout << "==========================\n"
+                 << endl;
         }
-        cout << "Doctor not found." << endl;
+        else
+        {
+            throw runtime_error("Doctor not found.");
+        }
     }
 
-    // ---- Additional utility methods ----
     void dischargePatient(int patientId)
     {
-        for (int i = 0; i < (int)patients.size(); i++)
+        auto it = patients.find(patientId);
+        if (it != patients.end())
         {
-            if (patients[i].getId() == patientId)
-            {
-                patients[i].dischargePatient();
-                return;
-            }
+            it->second->dischargePatient();
         }
-        cout << "Patient not found." << endl;
+        else
+        {
+            throw runtime_error("Patient not found.");
+        }
     }
 
     void addMedicalRecord(int patientId, string record)
     {
-        for (int i = 0; i < (int)patients.size(); i++)
+        auto it = patients.find(patientId);
+        if (it != patients.end())
         {
-            if (patients[i].getId() == patientId)
-            {
-                patients[i].addMedicalRecord(record);
-                return;
-            }
+            it->second->addMedicalRecord(record);
         }
-        cout << "Patient not found." << endl;
+        else
+        {
+            throw runtime_error("Patient not found.");
+        }
     }
 
     void requestTest(int patientId, string testName)
     {
-        for (int i = 0; i < (int)patients.size(); i++)
+        auto it = patients.find(patientId);
+        if (it != patients.end())
         {
-            if (patients[i].getId() == patientId)
-            {
-                patients[i].requestTest(testName);
-                return;
-            }
+            it->second->requestTest(testName);
         }
-        cout << "Patient not found." << endl;
+        else
+        {
+            throw runtime_error("Patient not found.");
+        }
     }
 
     void displayPatientHistory(int patientId)
     {
-        for (int i = 0; i < (int)patients.size(); i++)
+        auto it = patients.find(patientId);
+        if (it != patients.end())
         {
-            if (patients[i].getId() == patientId)
-            {
-                patients[i].displayHistory();
-                return;
-            }
+            it->second->displayHistory();
         }
-        cout << "Patient not found." << endl;
+        else
+        {
+            throw runtime_error("Patient not found.");
+        }
+    }
+
+    void listAllPatients()
+    {
+        cout << "\n=== All Registered Patients ===" << endl;
+        if (patients.empty())
+        {
+            cout << "No patients registered." << endl;
+        }
+        else
+        {
+            for (const auto &[id, patient] : patients)
+            {
+                cout << "ID: " << patient->getId()
+                     << ", Name: " << patient->getName()
+                     << ", Age: " << patient->getAge() << endl;
+            }
+            cout << "Total: " << patients.size() << " patients" << endl;
+        }
+        cout << endl;
+    }
+
+    void listAllDoctors()
+    {
+        cout << "\n=== All Registered Doctors ===" << endl;
+        if (doctors.empty())
+        {
+            cout << "No doctors registered." << endl;
+        }
+        else
+        {
+            for (const auto &[id, doctor] : doctors)
+            {
+                cout << "ID: " << doctor->getId()
+                     << ", Name: " << doctor->getName()
+                     << ", Dept: " << doctor->getDepartment() << endl;
+            }
+            cout << "Total: " << doctors.size() << " doctors" << endl;
+        }
+        cout << endl;
     }
 };
 
 // ========== HELPER FUNCTIONS ========== //
 
-// Function to convert input to enum value
 Department getDepartmentFromInput(int choice)
 {
     switch (choice)
@@ -496,12 +858,10 @@ Department getDepartmentFromInput(int choice)
     case 6:
         return GENERAL;
     default:
-        cout << "Invalid choice, defaulting to GENERAL.\n";
-        return GENERAL;
+        throw out_of_range("Invalid department choice");
     }
 }
 
-// Function to convert input to enum value
 RoomType getRoomTypeFromInput(int choice)
 {
     switch (choice)
@@ -515,174 +875,203 @@ RoomType getRoomTypeFromInput(int choice)
     case 4:
         return SEMI_PRIVATE;
     default:
-        cout << "Invalid choice, defaulting to GENERAL_WARD.\n";
-        return GENERAL_WARD;
+        throw out_of_range("Invalid room type choice");
     }
+}
+
+void clearInputStream()
+{
+    cin.clear();
+    cin.ignore(10000, '\n');
 }
 
 // ========== MAIN PROGRAM ========== //
 int main()
 {
-    Hospital hospital;
-    bool run = true;
-
-    while (run)
+    try
     {
-        int choice;
-        cout << endl;
-        cout << "========== HOSPITAL MANAGEMENT SYSTEM ==========" << endl;
-        cout << "1. Register new patient" << endl;
-        cout << "2. Add new doctor" << endl;
-        cout << "3. Admit Patient" << endl;
-        cout << "4. Book appointment" << endl;
-        cout << "5. Display Patient Info" << endl;
-        cout << "6. Display Doctor info" << endl;
-        cout << "7. Add Emergency Case" << endl;
-        cout << "8. Handle Emergency" << endl;
-        cout << "9. Discharge Patient" << endl;
-        cout << "10. Add Medical Record" << endl;
-        cout << "11. Request Test" << endl;
-        cout << "12. Display Patient History" << endl;
-        cout << "13. Exit" << endl;
-        cout << "Enter your choice: ";
-        cin >> choice;
+        Hospital hospital;
+        bool run = true;
 
-        // Input validation
-        if (cin.fail())
+        while (run)
         {
-            cin.clear();
-            cin.ignore(10000, '\n');
-            cout << "Invalid input. Please enter a number." << endl;
-            continue;
-        }
+            int choice;
+            cout << "========== HOSPITAL MANAGEMENT SYSTEM ==========" << endl;
+            cout << "1. Register new patient" << endl;
+            cout << "2. Add new doctor" << endl;
+            cout << "3. Admit Patient" << endl;
+            cout << "4. Book appointment" << endl;
+            cout << "5. Display Patient Info" << endl;
+            cout << "6. Display Doctor info" << endl;
+            cout << "7. Add Emergency Case" << endl;
+            cout << "8. Handle Emergency" << endl;
+            cout << "9. Discharge Patient" << endl;
+            cout << "10. Add Medical Record" << endl;
+            cout << "11. Request Test" << endl;
+            cout << "12. Display Patient History" << endl;
+            cout << "13. List All Patients" << endl;
+            cout << "14. List All Doctors" << endl;
+            cout << "15. Exit" << endl;
+            cout << "Enter your choice: ";
+            cin >> choice;
 
-        if (choice == 1)
-        {
-            string patientName, contact;
-            int patientAge;
+            if (cin.fail())
+            {
+                clearInputStream();
+                cout << "Invalid input. Please enter a number." << endl;
+                continue;
+            }
 
-            cout << "Please enter patient name: ";
-            cin >> patientName;
+            try
+            {
+                if (choice == 1)
+                {
+                    string patientName, contact;
+                    int patientAge;
 
-            cout << "Please enter patient age: ";
-            cin >> patientAge;
+                    cout << "Please enter patient name: ";
+                    clearInputStream();
+                    getline(cin, patientName);
 
-            cout << "Please enter patient contact: ";
-            cin >> contact;
+                    cout << "Please enter patient age: ";
+                    cin >> patientAge;
+                    // Note: No clearInputStream() here because we need the newline for the next getline
 
-            hospital.registerPatient(patientName, patientAge, contact);
-        }
-        else if (choice == 2)
-        {
-            int option;
-            string doctorName;
+                    cout << "Please enter patient contact: ";
+                    clearInputStream(); // Clear the newline from age input
+                    getline(cin, contact);
 
-            cout << "Please enter doctor name: ";
-            cin >> doctorName;
+                    hospital.registerPatient(patientName, patientAge, contact);
+                }
+                else if (choice == 2)
+                {
+                    int option;
+                    string doctorName;
 
-            cout << "Select department:\n";
-            cout << "1. Cardiology\n2. Neurology\n3. Orthopedics\n4. Pediatrics\n5. Emergency\n6. General\n";
-            cout << "Enter choice: ";
-            cin >> option;
+                    cout << "Please enter doctor name: ";
+                    clearInputStream();
+                    getline(cin, doctorName);
 
-            hospital.addDoctor(doctorName, getDepartmentFromInput(option));
-        }
-        else if (choice == 3)
-        {
-            int id;
-            int option;
+                    cout << "Select department:\n";
+                    cout << "1. Cardiology\n2. Neurology\n3. Orthopedics\n4. Pediatrics\n5. Emergency\n6. General\n";
+                    cout << "Enter choice: ";
+                    cin >> option;
 
-            cout << "Please enter patient id: ";
-            cin >> id;
+                    hospital.addDoctor(doctorName, getDepartmentFromInput(option));
+                }
+                else if (choice == 3)
+                {
+                    int id, option;
+                    cout << "Please enter patient id: ";
+                    cin >> id;
+                    cout << "Select room type:\n";
+                    cout << "1. General Ward\n2. ICU\n3. Private Room\n4. Semi-Private\n";
+                    cout << "Enter choice: ";
+                    cin >> option;
 
-            cout << "Select room type:\n";
-            cout << "1. General Ward\n2. ICU\n3. Private Room\n4. Semi-Private\n";
-            cout << "Enter choice: ";
-            cin >> option;
+                    hospital.admitPatient(id, getRoomTypeFromInput(option));
+                }
+                else if (choice == 4)
+                {
+                    int doctorId, patientId;
+                    cout << "Please enter doctor id: ";
+                    cin >> doctorId;
+                    cout << "Please enter patient id: ";
+                    cin >> patientId;
 
-            hospital.admitPatient(id, getRoomTypeFromInput(option));
-        }
-        else if (choice == 4)
-        {
-            int id1, id2;
-
-            cout << "Please enter doctor id: ";
-            cin >> id1;
-
-            cout << "Please enter patient id: ";
-            cin >> id2;
-
-            hospital.bookAppointment(id1, id2);
-        }
-        else if (choice == 5)
-        {
-            int id;
-            cout << "Please enter patient id: ";
-            cin >> id;
-            hospital.displayPatientInfo(id);
-        }
-        else if (choice == 6)
-        {
-            int id;
-            cout << "Please enter doctor id: ";
-            cin >> id;
-            hospital.displayDoctorInfo(id);
-        }
-        else if (choice == 7)
-        {
-            int id;
-            cout << "Please enter patient id for emergency: ";
-            cin >> id;
-            hospital.addEmergency(id);
-        }
-        else if (choice == 8)
-        {
-            hospital.handleEmergency();
-        }
-        else if (choice == 9)
-        {
-            int id;
-            cout << "Please enter patient id to discharge: ";
-            cin >> id;
-            hospital.dischargePatient(id);
-        }
-        else if (choice == 10)
-        {
-            int id;
-            string record;
-            cout << "Please enter patient id: ";
-            cin >> id;
-            cout << "Please enter medical record: ";
-            cin.ignore(); // Clear the newline character
-            getline(cin, record);
-            hospital.addMedicalRecord(id, record);
-        }
-        else if (choice == 11)
-        {
-            int id;
-            string testName;
-            cout << "Please enter patient id: ";
-            cin >> id;
-            cout << "Please enter test name: ";
-            cin >> testName;
-            hospital.requestTest(id, testName);
-        }
-        else if (choice == 12)
-        {
-            int id;
-            cout << "Please enter patient id: ";
-            cin >> id;
-            hospital.displayPatientHistory(id);
-        }
-        else if (choice == 13)
-        {
-            cout << "Exiting system. Goodbye!" << endl;
-            run = false;
-        }
-        else
-        {
-            cout << "Invalid choice. Please try again." << endl;
+                    hospital.bookAppointment(doctorId, patientId);
+                }
+                else if (choice == 5)
+                {
+                    int id;
+                    cout << "Please enter patient id: ";
+                    cin >> id;
+                    hospital.displayPatientInfo(id);
+                }
+                else if (choice == 6)
+                {
+                    int id;
+                    cout << "Please enter doctor id: ";
+                    cin >> id;
+                    hospital.displayDoctorInfo(id);
+                }
+                else if (choice == 7)
+                {
+                    int id;
+                    cout << "Please enter patient id for emergency: ";
+                    cin >> id;
+                    hospital.addEmergency(id);
+                }
+                else if (choice == 8)
+                {
+                    hospital.handleEmergency();
+                }
+                else if (choice == 9)
+                {
+                    int id;
+                    cout << "Please enter patient id to discharge: ";
+                    cin >> id;
+                    hospital.dischargePatient(id);
+                }
+                else if (choice == 10)
+                {
+                    int id;
+                    string record;
+                    cout << "Please enter patient id: ";
+                    cin >> id;
+                    cout << "Please enter medical record: ";
+                    clearInputStream();
+                    getline(cin, record);
+                    hospital.addMedicalRecord(id, record);
+                }
+                else if (choice == 11)
+                {
+                    int id;
+                    string testName;
+                    cout << "Please enter patient id: ";
+                    cin >> id;
+                    cout << "Please enter test name: ";
+                    clearInputStream();
+                    getline(cin, testName);
+                    hospital.requestTest(id, testName);
+                }
+                else if (choice == 12)
+                {
+                    int id;
+                    cout << "Please enter patient id: ";
+                    cin >> id;
+                    hospital.displayPatientHistory(id);
+                }
+                else if (choice == 13)
+                {
+                    hospital.listAllPatients();
+                }
+                else if (choice == 14)
+                {
+                    hospital.listAllDoctors();
+                }
+                else if (choice == 15)
+                {
+                    cout << "Exiting system. Goodbye!" << endl;
+                    run = false;
+                }
+                else
+                {
+                    cout << "Invalid choice. Please try again." << endl;
+                }
+            }
+            catch (const exception &e)
+            {
+                cerr << "Error: " << e.what() << endl;
+                clearInputStream();
+            }
         }
     }
+    catch (const exception &e)
+    {
+        cerr << "Fatal error: " << e.what() << endl;
+        return 1;
+    }
+
     return 0;
 }
